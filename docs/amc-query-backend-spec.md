@@ -1,5 +1,7 @@
-# AMC Audience Query Builder — 后端交付规格说明书
+# AMC Audience Query Builder — 后端交付规格说明书 v2
 
+> **v2 变更说明：** AMC 不支持 INTERSECT / EXCEPT 语法，全部改用 JOIN 方式实现集合运算。
+>
 > 本文档面向后端开发，定义 Query 模板、全部参数、枚举值及其对应的 SQL 替换片段。
 > 后端只需按此规格实现"参数 → SQL片段 替换 → 拼接"即可。
 
@@ -7,14 +9,16 @@
 
 ## 0. 文档阅读指南
 
-本文档结构如下：
-
 ```
-第1章  全局架构          ← 整条SQL的骨架、模块间如何拼接
-第2章  参数总表          ← 所有参数一览，一眼看全
-第3章  CTE SQL模板       ← 两种模板(广告行为/自然行为)的完整SQL
-第4章  参数明细          ← 每个参数的枚举值 → SQL替换值 映射表
-第5章  完整示例          ← 3个端到端的用户操作 → 最终SQL 案例
+第1章  全局架构              ← 整条SQL的骨架、模块间如何用JOIN拼接
+第2章  参数总表              ← 所有参数一览
+第3章  CTE SQL模板(行为段)   ← 两种模板(广告行为/自然行为)
+第4章  CTE SQL模板(组合段)   ← AND/OR/NOT 三种JOIN组合模板  ← 【新增】
+第5章  参数明细              ← 每个参数的枚举值 → SQL替换值 映射表
+第6章  完整示例              ← 4个端到端的用户操作 → 最终SQL 案例
+第7章  API请求体格式
+第8章  参数联动关系图
+第9章  安全与校验
 ```
 
 ---
@@ -23,35 +27,63 @@
 
 ### 1.1 最终输出的 SQL 结构
 
-无论用户配置了几个行为模块，最终输出的 SQL **始终**是以下结构：
+SQL 分为两层 CTE：**行为段**（每个行为模块产出 user_id 集合）+ **组合段**（用 JOIN 链式组合）。
+
+**单模块（无组合）：**
 
 ```sql
 WITH
-  seg_1 AS ( {行为模块1的CTE} ),
-  seg_2 AS ( {行为模块2的CTE} ),
-  ...
-  seg_N AS ( {行为模块N的CTE} )
+  seg_1 AS ( {行为CTE} )
 SELECT user_id FROM seg_1
-{集合运算符1}
-SELECT user_id FROM seg_2
-{集合运算符2}
-...
-SELECT user_id FROM seg_N
 ```
 
-### 1.2 集合运算符 — 参数 `${SET_OP}`
+**双模块：**
 
-模块之间的组合关系，从左到右依次计算：
+```sql
+WITH
+  seg_1 AS ( {行为CTE} ),
+  seg_2 AS ( {行为CTE} ),
+  combined AS (
+    {seg_1 和 seg_2 的 JOIN 组合}
+  )
+SELECT user_id FROM combined
+```
 
-| 前端显示 | 枚举值 | SQL 替换值 | 语义 |
-|---------|--------|-----------|------|
-| 且（交集） | `AND` | `INTERSECT` | 同时满足两个行为 |
-| 或（并集） | `OR` | `UNION` | 满足任一行为 |
-| 非（差集） | `NOT` | `EXCEPT` | 满足前者但排除后者 |
+**三模块及以上（链式组合）：**
 
-### 1.3 单模块时的退化
+```sql
+WITH
+  seg_1 AS ( {行为CTE} ),
+  seg_2 AS ( {行为CTE} ),
+  seg_3 AS ( {行为CTE} ),
+  combined_1 AS (
+    {seg_1 OP1 seg_2 的 JOIN 组合}
+  ),
+  combined_2 AS (
+    {combined_1 OP2 seg_3 的 JOIN 组合}
+  )
+SELECT user_id FROM combined_2
+```
 
-如果只有1个行为模块，没有集合运算，SQL退化为：
+**规律：**
+- N 个行为模块 → N 个 `seg_` CTE + (N-1) 个 `combined_` CTE
+- 每个 `combined_` 的左表是上一步的结果（首次是 `seg_1`），右表是下一个 `seg_`
+- 最终 SELECT 从最后一个 `combined_` 取数据
+
+### 1.2 集合运算符 → JOIN 映射 — 参数 `${SET_OP}`
+
+| 前端显示 | 枚举值 | JOIN 方式 | SQL 模板（见第4章详细） | 语义 |
+|---------|--------|----------|----------------------|------|
+| 且（交集） | `AND` | `INNER JOIN` | `SELECT a.user_id FROM {left} a INNER JOIN {right} b ON a.user_id = b.user_id` | 同时满足 |
+| 或（并集） | `OR` | `UNION ALL + GROUP BY` | `SELECT user_id FROM (SELECT user_id FROM {left} UNION ALL SELECT user_id FROM {right}) GROUP BY 1` | 满足任一 |
+| 非（差集） | `NOT` | `LEFT JOIN + IS NULL` | `SELECT a.user_id FROM {left} a LEFT JOIN {right} b ON a.user_id = b.user_id WHERE b.user_id IS NULL` | 排除 |
+
+> **为什么 OR 用 `UNION ALL + GROUP BY` 而非 `UNION`？**
+> AMC 对 `UNION`（去重）的支持不确定，而 `UNION ALL`（原始示例已验证可用）+ `GROUP BY 1` 达到相同效果且一定可行。
+
+### 1.3 单模块退化
+
+无组合段，直接输出行为段结果：
 
 ```sql
 WITH seg_1 AS ( {CTE} )
@@ -87,9 +119,9 @@ SELECT user_id FROM seg_1
 
 ---
 
-## 3. CTE SQL 模板
+## 3. CTE SQL 模板 — 行为段
 
-根据 `${EVENT_TYPE}` 所属类别，使用不同的 CTE 模板。
+每个行为模块生成一个 `seg_N`，输出 `user_id` 列。
 
 ### 3.1 模板A — 广告行为类（曝光 / 有效曝光 / 点击）
 
@@ -122,7 +154,7 @@ seg_{N} AS (
 )
 ```
 
-**模板A 动态裁剪规则：**
+**动态裁剪规则（与v1相同）：**
 
 | 用户选择的广告类型 | 包含的数据块 |
 |------------------|-------------|
@@ -146,11 +178,76 @@ seg_{N} AS (
 
 ---
 
-## 4. 参数明细 — 枚举值与 SQL 替换映射
+## 4. CTE SQL 模板 — 组合段（JOIN实现）
 
-### 4.1 `${EVENT_TYPE}` — 行为事件
+### 4.1 AND（交集）— INNER JOIN
 
-决定性参数，所有后续参数的可用性取决于此。
+```sql
+combined_{N} AS (
+  SELECT a.user_id
+  FROM {left_cte} a
+  INNER JOIN {right_seg} b ON a.user_id = b.user_id
+  GROUP BY 1
+)
+```
+
+### 4.2 OR（并集）— UNION ALL + GROUP BY
+
+```sql
+combined_{N} AS (
+  SELECT user_id
+  FROM (
+    SELECT user_id FROM {left_cte}
+    UNION ALL
+    SELECT user_id FROM {right_seg}
+  )
+  GROUP BY 1
+)
+```
+
+### 4.3 NOT（差集）— LEFT JOIN + IS NULL
+
+```sql
+combined_{N} AS (
+  SELECT a.user_id
+  FROM {left_cte} a
+  LEFT JOIN {right_seg} b ON a.user_id = b.user_id
+  WHERE b.user_id IS NULL
+  GROUP BY 1
+)
+```
+
+### 4.4 组合段的链式引用规则
+
+| 步骤 | `{left_cte}` 引用 | `{right_seg}` 引用 | 运算符来源 |
+|------|-------------------|-------------------|-----------|
+| 第1步 combined_1 | `seg_1` | `seg_2` | `connections[0].operation` |
+| 第2步 combined_2 | `combined_1` | `seg_3` | `connections[1].operation` |
+| 第3步 combined_3 | `combined_2` | `seg_4` | `connections[2].operation` |
+| ... | `combined_{N-1}` | `seg_{N+1}` | `connections[N-1].operation` |
+
+**伪代码：**
+
+```
+let left = "seg_1"
+
+for i in 0..connections.length:
+    right = "seg_{i+2}"
+    operation = connections[i].operation
+    combined_name = "combined_{i+1}"
+
+    生成 combined_name CTE（使用 4.1/4.2/4.3 对应模板，代入 left 和 right）
+
+    left = combined_name   // 下一轮的左表指向本轮结果
+
+最终 SELECT user_id FROM {left}
+```
+
+---
+
+## 5. 参数明细 — 枚举值与 SQL 替换映射
+
+### 5.1 `${EVENT_TYPE}` — 行为事件
 
 | 前端显示 | 枚举值 | SQL模板 | 后续可用参数 |
 |---------|--------|---------|-------------|
@@ -167,7 +264,7 @@ seg_{N} AS (
 
 ---
 
-### 4.2 `${TABLE_DSP}` / `${TABLE_SA}` / `${TABLE}` — 数据表名（由 EVENT_TYPE 自动决定）
+### 5.2 `${TABLE_DSP}` / `${TABLE_SA}` / `${TABLE}` — 数据表名（由 EVENT_TYPE 自动决定）
 
 后端根据 EVENT_TYPE 自动映射，前端不需要传此参数。
 
@@ -184,7 +281,7 @@ seg_{N} AS (
 
 ---
 
-### 4.3 `${METRIC_COL}` — 指标列名（由 EVENT_TYPE 自动决定）
+### 5.3 `${METRIC_COL}` — 指标列名（由 EVENT_TYPE 自动决定）
 
 | EVENT_TYPE | ${METRIC_COL} | 说明 |
 |-----------|--------------|------|
@@ -196,9 +293,7 @@ seg_{N} AS (
 
 ---
 
-### 4.4 `${AD_TYPE}` — 广告类型（多选）
-
-仅广告行为类可用。用户可多选，选择结果决定 UNION ALL 结构。
+### 5.4 `${AD_TYPE}` — 广告类型（多选）
 
 | 前端显示 | 枚举值 | 所属广告来源 | 影响 |
 |---------|--------|------------|------|
@@ -212,7 +307,6 @@ seg_{N} AS (
 
 ```
 选中的AD_TYPE列表
-    │
     ├── 包含任一 DSP类 (PVA/OLV)  →  needDSP = true  →  包含DSP数据块
     ├── 包含任一 SA类 (SP/SB/SD)  →  needSA  = true  →  包含SA数据块
     │
@@ -223,18 +317,16 @@ seg_{N} AS (
 
 ---
 
-### 4.5 `${ADV}` — Advertiser 过滤（DSP数据块专用）
+### 5.5 `${ADV}` — Advertiser 过滤（DSP数据块专用）
 
 | 用户操作 | SQL 替换值 |
 |---------|-----------|
 | 未填写 | `''`（空字符串，不生成任何SQL片段） |
 | 填写了 advertiser_id | `AND advertiser = '{advertiser_id}'` |
 
-**示例：** 用户填写 `ENTITY123` → `AND advertiser = 'ENTITY123'`
-
 ---
 
-### 4.6 `${ENTITY}` — Entity 过滤（SA数据块专用）
+### 5.6 `${ENTITY}` — Entity 过滤（SA数据块专用）
 
 | 用户操作 | SQL 替换值 |
 |---------|-----------|
@@ -243,49 +335,37 @@ seg_{N} AS (
 
 ---
 
-### 4.7 `${CAMPAIGN}` — Campaign 过滤
+### 5.7 `${CAMPAIGN}` — Campaign 过滤
 
 | 用户操作 | SQL 替换值 |
 |---------|-----------|
 | 未选择任何campaign | `''`（空字符串，不过滤） |
 | 选择了1个或多个campaign | `AND campaign IN ('{camp1}','{camp2}',...)` |
 
-**示例：** 用户输入了3个campaign →
-
-```sql
-AND campaign IN ('O-Brand-AW-IM_Smart Home-DP-CTR','O-Brand-AW-LS_Christmas-DP-CTR','O-Brand-AW-LS_DIY-DP-CTR')
-```
-
 ---
 
-### 4.8 `${TIME_FILTER}` — 行为时间
+### 5.8 `${TIME_FILTER}` — 行为时间
 
 | 用户操作 | 子类型 | SQL 替换值 |
 |---------|--------|-----------|
 | 选择固定时间段 | `fixed` | `AND date_partition BETWEEN '{startDate}' AND '{endDate}'` |
 | 选择相对时间 (过去N天) | `relative` | `AND date_partition >= DATE_FORMAT(DATE_ADD('day', -{N}, CURRENT_DATE), '%Y%m%d')` |
 
-**示例：**
-- 固定: 2024-01-01 ~ 2024-03-31 → `AND date_partition BETWEEN '20240101' AND '20240331'`
-- 相对: 过去30天 → `AND date_partition >= DATE_FORMAT(DATE_ADD('day', -30, CURRENT_DATE), '%Y%m%d')`
-
 > **注意：** date_partition 格式为 `yyyyMMdd`（无分隔符），需确认AMC实例的实际格式。
 
 ---
 
-### 4.9 `${ATTR_TYPE}` — 行为属性类型（自然行为类专用）
+### 5.9 `${ATTR_TYPE}` — 行为属性类型（自然行为类专用）
 
-不同的行为事件可选的属性类型不同：
-
-| EVENT_TYPE | 可选的 ATTR_TYPE 枚举值 |
-|-----------|----------------------|
+| EVENT_TYPE | 可选的 ATTR_TYPE |
+|-----------|-----------------|
 | `search` | `search_term` |
 | `detail_page_view` | `product_line`, `asin` |
 | `add_to_cart` | `product_line`, `asin` |
 | `add_to_wishlist` | `product_line`, `asin` |
 | `purchase` | `product_line`, `asin` |
 
-各 ATTR_TYPE 对应的数据库列名：
+对应数据库列名：
 
 | 前端显示 | 枚举值 | 对应表列名 |
 |---------|--------|----------|
@@ -295,7 +375,7 @@ AND campaign IN ('O-Brand-AW-IM_Smart Home-DP-CTR','O-Brand-AW-LS_Christmas-DP-C
 
 ---
 
-### 4.10 `${MATCH_TYPE}` — 属性匹配方式
+### 5.10 `${MATCH_TYPE}` — 属性匹配方式
 
 | 前端显示 | 枚举值 | 适用 ATTR_TYPE | 说明 |
 |---------|--------|---------------|------|
@@ -304,9 +384,9 @@ AND campaign IN ('O-Brand-AW-IM_Smart Home-DP-CTR','O-Brand-AW-LS_Christmas-DP-C
 
 ---
 
-### 4.11 `${ATTR_FILTER}` — 属性筛选（由 ATTR_TYPE + MATCH_TYPE + ATTR_VALUES 组合生成）
+### 5.11 `${ATTR_FILTER}` — 属性筛选（组合生成）
 
-此为组合参数。后端根据 4.9、4.10、4.12 三个参数组合生成最终SQL片段：
+由 ATTR_TYPE + MATCH_TYPE + ATTR_VALUES 三者组合生成：
 
 | ATTR_TYPE | MATCH_TYPE | 用户输入值 | SQL 替换值 |
 |-----------|------------|-----------|-----------|
@@ -318,16 +398,7 @@ AND campaign IN ('O-Brand-AW-IM_Smart Home-DP-CTR','O-Brand-AW-LS_Christmas-DP-C
 
 ---
 
-### 4.12 `${ATTR_VALUES}` — 属性值（用户多值输入）
-
-- 类型：字符串数组
-- 前端允许用户输入多个值（逗号分隔或tag输入）
-- 传给后端的格式：`string[]`
-- 后端在生成SQL时需对每个值加单引号包裹，并做SQL注入转义
-
----
-
-### 4.13 `${METRIC_TYPE}` — 统计指标类型
+### 5.12 `${METRIC_TYPE}` — 统计指标类型
 
 | EVENT_TYPE | 前端显示 | 枚举值 | 说明 |
 |-----------|---------|--------|------|
@@ -336,17 +407,13 @@ AND campaign IN ('O-Brand-AW-IM_Smart Home-DP-CTR','O-Brand-AW-LS_Christmas-DP-C
 
 ---
 
-### 4.14 `${HAVING_CLAUSE}` — 统计聚合（由 METRIC_TYPE + METRIC_OP + METRIC_VAL 组合生成）
-
-此为组合参数。后端根据行为类型和指标类型生成：
+### 5.13 `${HAVING_CLAUSE}` — 统计聚合（组合生成）
 
 **广告行为类（模板A）：**
 
 | METRIC_TYPE | SQL 替换值 |
 |------------|-----------|
 | `count` | `SUM(metric_value) ${METRIC_OP} ${METRIC_VAL}` |
-
-> metric_value 是模板A中 SELECT 的别名，已经映射了正确的指标列。
 
 **自然行为类（模板B）：**
 
@@ -357,7 +424,7 @@ AND campaign IN ('O-Brand-AW-IM_Smart Home-DP-CTR','O-Brand-AW-LS_Christmas-DP-C
 
 ---
 
-### 4.15 `${METRIC_OP}` — 统计条件（比较运算符）
+### 5.14 `${METRIC_OP}` — 统计条件
 
 | 前端显示 | 枚举值 | SQL 替换值 |
 |---------|--------|-----------|
@@ -370,7 +437,7 @@ AND campaign IN ('O-Brand-AW-IM_Smart Home-DP-CTR','O-Brand-AW-LS_Christmas-DP-C
 
 ---
 
-### 4.16 `${METRIC_VAL}` — 统计值
+### 5.15 `${METRIC_VAL}` — 统计值
 
 - 类型：正整数 或 正浮点数（金额时）
 - 前端校验：> 0
@@ -378,50 +445,26 @@ AND campaign IN ('O-Brand-AW-IM_Smart Home-DP-CTR','O-Brand-AW-LS_Christmas-DP-C
 
 ---
 
-## 5. 完整端到端示例
+## 6. 完整端到端示例
 
-### 示例1：曝光未购买（你的原始示例）
+### 示例1：曝光未购买（原始示例 — 2模块 NOT）
 
 **用户操作：**
 
-| 配置项 | 模块1 | 模块2 |
-|-------|-------|-------|
-| 行为事件 | 曝光 (`impression`) | 购买 (`purchase`) |
-| 广告类型 | PVA + SP (DSP+SA) | — |
-| Advertiser | — | — |
-| Entity | — | — |
-| Campaign | 4个campaign | — |
-| 时间 | 默认 | 默认 |
-| 属性 | — | — |
-| 统计指标 | 次数 >= 1 | 次数 >= 1 (total_product_sales > 0) |
-| **集合运算** | — **NOT** → | |
+| 配置项 | 模块1 | | 模块2 |
+|-------|-------|---|-------|
+| 行为事件 | 曝光 (`impression`) | **NOT** | 购买 (`purchase`) |
+| 广告类型 | PVA + SP (DSP+SA) | | — |
+| Campaign | 4个campaign | | — |
+| 统计指标 | 次数 >= 1 | | total_product_sales > 0 |
 
-**参数值：**
+**CTE构建过程：**
 
 ```
-模块1:
-  EVENT_TYPE   = impression
-  AD_TYPE      = [PVA, SP]        → needDSP=true, needSA=true → UNION ALL
-  ADV          = ''               → (空)
-  ENTITY       = ''               → (空)
-  CAMPAIGN     = ['O-Divoom-Digital Picture Frame-AW-IM_Smart Home-DP-CTR',
-                  'O-Divoom-Digital Picture Frame-AW-LS_Christmas-DP-CTR',
-                  'O-Divoom-Digital Picture Frame-AW-LS_Interested in DIY-DP-CTR',
-                  'O-Divoom-Digital Picture Frame-AW-LS_Video Games-DP-CTR']
-  TIME_FILTER  = ''               → (空，不限时间)
-  METRIC_OP    = gte              → >=
-  METRIC_VAL   = 1
-
-模块2:
-  EVENT_TYPE   = purchase
-  TABLE        = conversions_all_for_audiences
-  ATTR_FILTER  = ''               → (空，不限属性)
-  TIME_FILTER  = ''               → (空)
-  METRIC_TYPE  = count
-  METRIC_OP    = gte              → (体现为 total_product_sales > 0)
-  METRIC_VAL   = 1
-
-SET_OP[0]      = NOT              → EXCEPT
+seg_1: 模板A (impression, DSP+SA, UNION ALL)
+seg_2: 模板B (purchase, total_product_sales > 0)
+combined_1: seg_1 NOT seg_2  →  LEFT JOIN + IS NULL
+最终: SELECT user_id FROM combined_1
 ```
 
 **生成的SQL：**
@@ -452,27 +495,43 @@ seg_2 AS (
   WHERE user_id_type = 'adUserId'
     AND total_product_sales > 0
   GROUP BY 1
+),
+combined_1 AS (
+  SELECT a.user_id
+  FROM seg_1 a
+  LEFT JOIN seg_2 b ON a.user_id = b.user_id
+  WHERE b.user_id IS NULL
+  GROUP BY 1
 )
-SELECT user_id FROM seg_1
-EXCEPT
-SELECT user_id FROM seg_2
+SELECT user_id FROM combined_1
 ```
+
+> **对比你的原始SQL**：结构完全一致，`FROM IMPS a LEFT JOIN PURS b ON ... WHERE b.user_id IS NULL` 就是这个模式。
 
 ---
 
-### 示例2：搜索过关键词 + 浏览过详情页 + 未购买
+### 示例2：搜索 + 浏览 + 未购买（3模块链式 AND → NOT）
 
 **用户操作：**
 
-| 配置项 | 模块1 | 模块2 | 模块3 |
-|-------|-------|-------|-------|
-| 行为事件 | 搜索 (`search`) | 详情页浏览 (`detail_page_view`) | 购买 (`purchase`) |
-| 属性类型 | 搜索词 | ASIN | — |
-| 匹配方式 | 模糊匹配 | 精准匹配 | — |
-| 属性值 | `['digital frame','pixel art']` | `['B0AAAAAA','B0BBBBBB']` | — |
-| 时间 | 过去30天 | 过去30天 | 过去30天 |
-| 统计指标 | 次数 >= 2 | 次数 >= 1 | 次数 >= 1 |
-| **集合运算** | — **AND** → | — **NOT** → | |
+| 配置项 | 模块1 | | 模块2 | | 模块3 |
+|-------|-------|---|-------|---|-------|
+| 行为事件 | 搜索 | **AND** | 详情页浏览 | **NOT** | 购买 |
+| 属性 | 搜索词 模糊匹配 | | ASIN 精准匹配 | | — |
+| 属性值 | `['digital frame','pixel art']` | | `['B0AAAAAA','B0BBBBBB']` | | — |
+| 时间 | 过去30天 | | 过去30天 | | 过去30天 |
+| 统计指标 | 次数 >= 2 | | 次数 >= 1 | | 次数 >= 1 |
+
+**CTE构建过程：**
+
+```
+seg_1: 模板B (search, 模糊匹配)
+seg_2: 模板B (detail_page_view, ASIN精准)
+seg_3: 模板B (purchase)
+combined_1: seg_1 AND seg_2      →  INNER JOIN
+combined_2: combined_1 NOT seg_3 →  LEFT JOIN + IS NULL
+最终: SELECT user_id FROM combined_2
+```
 
 **生成的SQL：**
 
@@ -503,17 +562,26 @@ seg_3 AS (
     AND date_partition >= DATE_FORMAT(DATE_ADD('day', -30, CURRENT_DATE), '%Y%m%d')
   GROUP BY 1
   HAVING COUNT(1) >= 1
+),
+combined_1 AS (
+  SELECT a.user_id
+  FROM seg_1 a
+  INNER JOIN seg_2 b ON a.user_id = b.user_id
+  GROUP BY 1
+),
+combined_2 AS (
+  SELECT a.user_id
+  FROM combined_1 a
+  LEFT JOIN seg_3 b ON a.user_id = b.user_id
+  WHERE b.user_id IS NULL
+  GROUP BY 1
 )
-SELECT user_id FROM seg_1
-INTERSECT
-SELECT user_id FROM seg_2
-EXCEPT
-SELECT user_id FROM seg_3
+SELECT user_id FROM combined_2
 ```
 
 ---
 
-### 示例3：高价值点击用户（仅SA广告）
+### 示例3：高价值点击用户（单模块，仅SA）
 
 **用户操作：**
 
@@ -525,29 +593,7 @@ SELECT user_id FROM seg_3
 | 时间 | 2024-01-01 ~ 2024-06-30 |
 | 统计指标 | 次数 >= 5 |
 
-**参数 → SQL 映射过程：**
-
-```
-EVENT_TYPE = click
-  → 模板A
-  → TABLE_SA = sponsored_ads_traffic_for_audiences
-  → METRIC_COL = clicks
-
-AD_TYPE = [SP, SB]
-  → 全部属于SA → needDSP=false, needSA=true
-  → 裁剪DSP数据块，仅保留SA数据块（无UNION ALL）
-
-CAMPAIGN = ['SP-Brand-Auto','SB-Brand-Video']
-  → AND campaign IN ('SP-Brand-Auto','SB-Brand-Video')
-
-TIME_FILTER = fixed, 2024-01-01 ~ 2024-06-30
-  → AND date_partition BETWEEN '20240101' AND '20240630'
-
-HAVING = count, gte, 5
-  → SUM(metric_value) >= 5
-```
-
-**生成的SQL（注意：无UNION ALL，因为只选了SA类型）：**
+**生成的SQL（单模块无组合段，注意仅SA无UNION ALL）：**
 
 ```sql
 WITH
@@ -569,7 +615,67 @@ SELECT user_id FROM seg_1
 
 ---
 
-## 6. 前端 → 后端 API 请求体格式（建议）
+### 示例4：曝光 或 搜索 的用户（2模块 OR）
+
+**用户操作：**
+
+| 配置项 | 模块1 | | 模块2 |
+|-------|-------|---|-------|
+| 行为事件 | 曝光 (`impression`) | **OR** | 搜索 (`search`) |
+| 广告类型 | SP (仅SA) | | — |
+| 属性 | — | | 搜索词 精准 `['pixel art']` |
+| 时间 | 过去14天 | | 过去14天 |
+| 统计指标 | 次数 >= 1 | | 次数 >= 1 |
+
+**CTE构建过程：**
+
+```
+seg_1: 模板A (impression, 仅SA)
+seg_2: 模板B (search, 精准匹配)
+combined_1: seg_1 OR seg_2  →  UNION ALL + GROUP BY
+最终: SELECT user_id FROM combined_1
+```
+
+**生成的SQL：**
+
+```sql
+WITH
+seg_1 AS (
+  SELECT user_id
+  FROM (
+    SELECT user_id, impressions AS metric_value
+    FROM sponsored_ads_traffic_for_audiences
+    WHERE user_id_type = 'adUserId'
+      AND impressions > 0
+      AND date_partition >= DATE_FORMAT(DATE_ADD('day', -14, CURRENT_DATE), '%Y%m%d')
+  )
+  GROUP BY 1
+  HAVING SUM(metric_value) >= 1
+),
+seg_2 AS (
+  SELECT user_id
+  FROM amazon_organic_search_for_audiences
+  WHERE user_id_type = 'adUserId'
+    AND date_partition >= DATE_FORMAT(DATE_ADD('day', -14, CURRENT_DATE), '%Y%m%d')
+    AND search_term IN ('pixel art')
+  GROUP BY 1
+  HAVING COUNT(1) >= 1
+),
+combined_1 AS (
+  SELECT user_id
+  FROM (
+    SELECT user_id FROM seg_1
+    UNION ALL
+    SELECT user_id FROM seg_2
+  )
+  GROUP BY 1
+)
+SELECT user_id FROM combined_1
+```
+
+---
+
+## 7. 前端 → 后端 API 请求体格式
 
 ```jsonc
 {
@@ -620,7 +726,7 @@ SELECT user_id FROM seg_1
 
 ---
 
-## 7. 参数联动关系图（前端渲染控制）
+## 8. 参数联动关系图（前端渲染控制）
 
 ```
 ${EVENT_TYPE} 变更
@@ -649,16 +755,16 @@ ${EVENT_TYPE} 变更
 
 ---
 
-## 8. 安全与校验
+## 9. 安全与校验
 
-### 8.1 SQL注入防护
+### 9.1 SQL注入防护
 
 所有用户输入值（CAMPAIGN、ATTR_VALUES、ADV、ENTITY）在拼接SQL前必须：
 - 转义单引号：`'` → `''`
 - 去除分号、注释符等危险字符
 - **推荐使用参数化查询** 如果AMC API支持
 
-### 8.2 前端校验规则
+### 9.2 前端校验规则
 
 | 校验项 | 规则 |
 |-------|------|
@@ -668,3 +774,16 @@ ${EVENT_TYPE} 变更
 | METRIC_VAL | 必须 > 0 |
 | TIME_FILTER | 开始日期 <= 结束日期；相对天数 > 0 |
 | ATTR_VALUES | 非空时每个值不能为空字符串 |
+
+---
+
+## 附录：v1 → v2 变更对照
+
+| 项目 | v1 (INTERSECT/EXCEPT) | v2 (JOIN) |
+|------|----------------------|-----------|
+| AND (交集) | `SELECT .. FROM seg_1 INTERSECT SELECT .. FROM seg_2` | `INNER JOIN` |
+| OR (并集) | `SELECT .. FROM seg_1 UNION SELECT .. FROM seg_2` | `UNION ALL + GROUP BY`（UNION ALL已验证可用） |
+| NOT (差集) | `SELECT .. FROM seg_1 EXCEPT SELECT .. FROM seg_2` | `LEFT JOIN + IS NULL` |
+| 3+模块 | 直接串联SET运算 | 需要链式 `combined_N` CTE |
+| SQL长度 | 较短 | 稍长（多了组合段CTE） |
+| AMC兼容性 | **不兼容** | **兼容** |
